@@ -386,5 +386,14 @@ def process_stack(job: Job) -> str:
     return result_path
 
 
-# ─── Static files (must be last) ──────────────────────────────────────────────
+# ─── Health check (keep-alive for Render free tier) ──────────────────────────
+
+@app.get("/health")
+@app.head("/health")
+@app.get("/ping")
+async def health():
+    return {"status": "ok", "service": "slap-web", "jobs": len(jobs)}
+
+
+# ─── Static files (must be last) ─────────────────────────────────────────────
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
