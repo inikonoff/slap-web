@@ -67,13 +67,30 @@ function handleFiles(files) {
 
 function renderThumbnails() {
   thumbGrid.innerHTML = '';
-  selectedFiles.forEach(file => {
+
+  selectedFiles.forEach((file, index) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'thumb-wrap';
+
     const img = document.createElement('img');
     img.alt = file.name;
+    img.title = file.name;
     const reader = new FileReader();
     reader.onload = e => { img.src = e.target.result; };
     reader.readAsDataURL(file);
-    thumbGrid.appendChild(img);
+
+    const btn = document.createElement('button');
+    btn.className = 'thumb-remove';
+    btn.innerHTML = '✕';
+    btn.title = 'Удалить кадр';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      removeFile(index);
+    };
+
+    wrap.appendChild(img);
+    wrap.appendChild(btn);
+    thumbGrid.appendChild(wrap);
   });
 
   const maxSide = getMaxSide(selectedFiles.length);
@@ -86,6 +103,19 @@ function renderThumbnails() {
 
   dropContent.hidden = true;
   thumbGrid.hidden   = false;
+}
+
+function removeFile(index) {
+  selectedFiles = selectedFiles.filter((_, i) => i !== index);
+  if (selectedFiles.length === 0) {
+    dropContent.hidden = false;
+    thumbGrid.hidden   = true;
+    thumbGrid.innerHTML = '';
+    btnSlap.disabled   = true;
+  } else {
+    renderThumbnails();
+    btnSlap.disabled = selectedFiles.length < 2;
+  }
 }
 
 function plural(n) {
@@ -125,11 +155,11 @@ function resizeImage(file, maxSide) {
       canvas.width  = nw;
       canvas.height = nh;
       canvas.getContext('2d').drawImage(img, 0, 0, nw, nh);
-      // quality=1.0 — максимальное качество, избегаем двойного сжатия
+      // PNG — без потерь на этапе подготовки, сервер сам сожмёт в выбранный формат
       canvas.toBlob(blob => {
         if (blob) resolve(blob);
         else reject(new Error('Canvas toBlob failed'));
-      }, 'image/jpeg', 1.0);
+      }, 'image/png');
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -171,7 +201,11 @@ async function startStack() {
   setProgress(32, 'Загрузка на сервер...');
   const formData = new FormData();
   const fmt = document.getElementById('fmt-select').value;  // 'jpeg' | 'png'
-  blobs.forEach((blob, i) => formData.append('files', blob, selectedFiles[i].name));
+  // Отправляем как PNG — без потерь, сервер примет любой формат
+  blobs.forEach((blob, i) => {
+    const name = selectedFiles[i].name.replace(/\.jpe?g$/i, '.png');
+    formData.append('files', blob, name);
+  });
   formData.append('fmt', fmt);
 
   let jobId;
