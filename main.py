@@ -236,7 +236,7 @@ def resize_to_max(img: np.ndarray, max_side: int) -> np.ndarray:
     return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
-def compute_sharpness(gray: np.ndarray, blur_radius: int = 9) -> np.ndarray:
+def compute_sharpness(gray: np.ndarray, blur_radius: int = 21) -> np.ndarray:
     """Tenengrad focus measure (Sobel-based)."""
     gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
@@ -325,8 +325,10 @@ def compute_valid_area(shape: tuple, transforms: list) -> tuple:
 
 
 def denoise_topology(topology: np.ndarray) -> np.ndarray:
-    """Replace single-pixel outliers with median of 4 neighbours."""
+    """Remove outliers: single-pixel neighbour check + median blur for smooth zones."""
     result = topology.copy()
+
+    # Шаг 1: одиночные выбросы (4-сосед)
     c = topology[1:-1, 1:-1]
     neighbours = np.stack([
         topology[1:-1, :-2],
@@ -337,6 +339,12 @@ def denoise_topology(topology: np.ndarray) -> np.ndarray:
     all_differ = np.all(neighbours != c, axis=0)
     median_n = np.median(neighbours, axis=0).astype(np.int32)
     result[1:-1, 1:-1] = np.where(all_differ, median_n, c)
+
+    # Шаг 2: медианный фильтр 7x7 — сглаживает "острова" в боке-зонах
+    topo_u8 = result.astype(np.uint8)
+    topo_u8 = cv2.medianBlur(topo_u8, 7)
+    result = topo_u8.astype(np.int32)
+
     return result
 
 
