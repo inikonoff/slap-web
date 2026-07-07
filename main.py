@@ -167,8 +167,8 @@ async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str
 
     file_paths = []
     for i, file in enumerate(files):
-        if file.content_type not in ("image/jpeg", "image/jpg"):
-            raise HTTPException(400, f'Файл "{file.filename}" не является JPEG.')
+        if file.content_type not in ("image/jpeg", "image/jpg", "image/png"):
+            raise HTTPException(400, f'Файл "{file.filename}" должен быть JPEG или PNG.')
         content = await file.read()
         if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
             raise HTTPException(400, f'Файл "{file.filename}" превышает {MAX_FILE_SIZE_MB} МБ.')
