@@ -49,9 +49,15 @@
           <button class="btn-help" id="btn-help" onclick="openModal()">
             <span>?</span> Инструкция
           </button>
-          <button class="btn-slap" id="btn-slap" disabled onclick="startStack()">
-            SLAP
-          </button>
+          <div class="slap-controls">
+            <select class="fmt-select" id="fmt-select" onchange="onFormatChange()">
+              <option value="jpeg">JPEG 98% (~2–4 МБ)</option>
+              <option value="png">PNG без потерь (~10–20 МБ)</option>
+            </select>
+            <button class="btn-slap" id="btn-slap" disabled onclick="startStack()">
+              SLAP
+            </button>
+          </div>
         </div>
       </div>
 

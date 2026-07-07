@@ -155,6 +155,26 @@ main {
   color: var(--text);
 }
 
+.slap-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fmt-select {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 10px;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: #fff;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.fmt-select:hover,
+.fmt-select:focus { border-color: var(--accent); }
+
 .btn-slap {
   background: var(--accent);
   color: #fff;
