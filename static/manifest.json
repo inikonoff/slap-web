@@ -1,0 +1,24 @@
+{
+  "name": "SLAP™ — Stack Like A Pro",
+  "short_name": "SLAP™",
+  "description": "Online focus stacking for macro photographers",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f2f2f2",
+  "theme_color": "#e8330a",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
