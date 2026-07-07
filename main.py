@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
@@ -43,13 +43,14 @@ rate_limit_store: dict = {}
 
 
 class Job:
-    def __init__(self, job_id: str, file_paths: list):
+    def __init__(self, job_id: str, file_paths: list, fmt: str = "jpeg"):
         self.job_id = job_id
         self.file_paths = file_paths
         self.state = "queued"          # queued | processing | done | error
         self.progress = 0              # 0–100
         self.status_text = "В очереди..."
         self.queue_position = 0
+        self.fmt = fmt  # "jpeg" | "png"
         self.result_path: Optional[str] = None
         self.error: Optional[str] = None
         self.created_at = time.time()
@@ -150,7 +151,7 @@ def check_rate_limit(ip: str) -> bool:
 # ─── API endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/api/upload")
-async def upload(request: Request, files: list[UploadFile] = File(...)):
+async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str = Form("jpeg")):
     ip = request.client.host
     if not check_rate_limit(ip):
         raise HTTPException(429, "Слишком много запросов. Попробуйте через час.")
@@ -175,7 +176,8 @@ async def upload(request: Request, files: list[UploadFile] = File(...)):
             f.write(content)
         file_paths.append(path)
 
-    job = Job(job_id, file_paths)
+    fmt = fmt if fmt in ("jpeg", "png") else "jpeg"
+    job = Job(job_id, file_paths, fmt)
     queued_count = sum(1 for j in jobs.values() if j.state == "queued")
     job.queue_position = queued_count
     if queued_count > 0:
@@ -214,10 +216,12 @@ async def get_result(job_id: str):
         raise HTTPException(404, "Результат не найден.")
     if not os.path.exists(job.result_path):
         raise HTTPException(404, "Файл результата уже удалён.")
+    ext = "png" if job.fmt == "png" else "jpg"
+    mime = "image/png" if job.fmt == "png" else "image/jpeg"
     return FileResponse(
         job.result_path,
-        media_type="image/jpeg",
-        filename=f"slap_{job_id[:8]}.jpg",
+        media_type=mime,
+        filename=f"slap_{job_id[:8]}.{ext}",
     )
 
 
@@ -380,8 +384,12 @@ def process_stack(job: Job) -> str:
     # 6. Save
     job.status_text = "Сохранение результата..."
     job.progress = 96
-    result_path = str(RESULT_DIR / f"{job.job_id}.jpg")
-    cv2.imwrite(result_path, result, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if job.fmt == "png":
+        result_path = str(RESULT_DIR / f"{job.job_id}.png")
+        cv2.imwrite(result_path, result)
+    else:
+        result_path = str(RESULT_DIR / f"{job.job_id}.jpg")
+        cv2.imwrite(result_path, result, [cv2.IMWRITE_JPEG_QUALITY, 98])
 
     return result_path
 
