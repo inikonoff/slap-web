@@ -4,6 +4,7 @@ import numpy as np
 import os
 import uuid
 import time
+import gc
 import logging
 from pathlib import Path
 from typing import Optional
@@ -256,6 +257,7 @@ def align_images(images: list, job: Job) -> tuple:
     # Coarse alignment at reduced resolution
     scale = min(1.0, 1024 / max(h, w))
     ref_small = cv2.resize(ref_gray, None, fx=scale, fy=scale)
+    del ref_gray  # освобождаем — больше не нужна
 
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-4)
     aligned = [reference]
@@ -267,6 +269,7 @@ def align_images(images: list, job: Job) -> tuple:
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
         gray_small = cv2.resize(gray, None, fx=scale, fy=scale)
+        del gray  # освобождаем сразу после resize
 
         warp = np.eye(2, 3, dtype=np.float32)
         try:
@@ -275,6 +278,7 @@ def align_images(images: list, job: Job) -> tuple:
             warp[1, 2] /= scale
         except cv2.error:
             logger.warning(f"ECC failed for frame {i}, using identity")
+        del gray_small
 
         warped = cv2.warpAffine(
             img, warp, (w, h),
@@ -284,7 +288,9 @@ def align_images(images: list, job: Job) -> tuple:
         )
         aligned.append(warped)
         transforms.append(warp)
+        gc.collect()
 
+    del ref_small
     return aligned, transforms
 
 
@@ -337,7 +343,7 @@ def denoise_topology(topology: np.ndarray) -> np.ndarray:
 def process_stack(job: Job) -> str:
     """Full stacking pipeline: load → resize → align → focusmeasure → merge → crop → save."""
 
-    # 1. Load + resize
+    # 1. Load + resize (читаем по одному, не храним оригиналы)
     job.status_text = "Загрузка изображений..."
     job.progress = 5
     images = []
@@ -347,13 +353,17 @@ def process_stack(job: Job) -> str:
             raise ValueError(f"Не удалось прочитать: {os.path.basename(path)}")
         img = resize_to_max(img, MAX_LONG_SIDE)
         images.append(img)
+    gc.collect()
 
     # 2. Align
     aligned, transforms = align_images(images, job)
+    del images  # оригиналы больше не нужны — освобождаем
+    gc.collect()
 
     # 3. Focus measure + topology
+    # best_sharpness храним как float32 вместо float64 — вдвое меньше памяти
     h, w = aligned[0].shape[:2]
-    best_sharpness = np.full((h, w), -np.inf, dtype=np.float64)
+    best_sharpness = np.full((h, w), -np.inf, dtype=np.float32)
     topology = np.zeros((h, w), dtype=np.int32)
     result = np.zeros_like(aligned[0])
 
@@ -361,11 +371,18 @@ def process_stack(job: Job) -> str:
         job.status_text = f"Слияние: кадр {i + 1} из {len(aligned)}..."
         job.progress = 40 + int(38 * (i + 1) / len(aligned))
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        sharpness = compute_sharpness(gray)
+        sharpness = compute_sharpness(gray).astype(np.float32)
+        del gray
         mask = sharpness > best_sharpness
         best_sharpness[mask] = sharpness[mask]
+        del sharpness
         topology[mask] = i
         result[mask] = img[mask]
+        del mask
+        gc.collect()
+
+    del best_sharpness  # карта резкости больше не нужна
+    gc.collect()
 
     # 4. Denoise topology
     job.status_text = "Сглаживание маски..."
@@ -374,12 +391,18 @@ def process_stack(job: Job) -> str:
     for i, img in enumerate(aligned):
         m = topology == i
         result[m] = img[m]
+        del m
+
+    del topology
+    del aligned
+    gc.collect()
 
     # 5. Crop valid area
     job.status_text = "Обрезка краёв..."
     job.progress = 90
-    x1, y1, x2, y2 = compute_valid_area(aligned[0].shape, transforms)
-    result = result[y1:y2, x1:x2]
+    x1, y1, x2, y2 = compute_valid_area(result.shape, transforms)
+    result = result[y1:y2, x1:x2].copy()  # .copy() освобождает ссылку на большой массив
+    gc.collect()
 
     # 6. Save
     job.status_text = "Сохранение результата..."
@@ -391,6 +414,8 @@ def process_stack(job: Job) -> str:
         result_path = str(RESULT_DIR / f"{job.job_id}.jpg")
         cv2.imwrite(result_path, result, [cv2.IMWRITE_JPEG_QUALITY, 98])
 
+    del result
+    gc.collect()
     return result_path
 
 
