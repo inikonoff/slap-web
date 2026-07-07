@@ -255,7 +255,7 @@ def align_images(images: list, job: Job) -> tuple:
     ref_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
     # Coarse alignment at reduced resolution
-    scale = min(1.0, 1024 / max(h, w))
+    scale = min(1.0, 1536 / max(h, w))
     ref_small = cv2.resize(ref_gray, None, fx=scale, fy=scale)
     del ref_gray  # освобождаем — больше не нужна
 
