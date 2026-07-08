@@ -1,8 +1,9 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" translate="no">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="google" content="notranslate" />
   <title>SLAP™ — Stack Like A Pro</title>
   <link rel="stylesheet" href="style.css" />
   <link rel="icon" href="/favicon.ico" sizes="any" />
@@ -46,8 +47,8 @@
             <div class="drop-icon">📷</div>
             <div class="drop-title">Перетащите фотографии сюда</div>
             <div class="drop-hint">или нажмите для выбора файлов</div>
-            <div class="drop-limits">
-              До 30 файлов JPEG&nbsp;·&nbsp;изображения будут уменьшены до 2048px&nbsp;·&nbsp;результат хранится 15 минут
+            <div class="drop-limits" id="drop-limits">
+              До 30 файлов JPEG&nbsp;·&nbsp;до 15 кадров → 3072px, больше → 2048px&nbsp;·&nbsp;результат хранится 15 минут
             </div>
           </div>
           <div id="thumb-grid" class="thumb-grid" hidden></div>
