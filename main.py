@@ -294,6 +294,28 @@ def align_images(images: list, job: Job) -> tuple:
     return aligned, transforms
 
 
+def match_exposure(aligned: list) -> list:
+    """
+    Выравнивает яркость/цвет каждого кадра относительно первого (референсного).
+    Убирает видимые "швы" между донорскими зонами разных кадров в гладких
+    областях (боке), где микроразличия экспозиции иначе становятся заметны.
+    """
+    reference = aligned[0]
+    # Средняя яркость по каждому каналу референса (используем всё изображение —
+    # после ECC-выравнивания края почти совпадают, крайние случаи погоды не делают)
+    ref_mean = reference.reshape(-1, 3).mean(axis=0).astype(np.float32)
+
+    result = [reference]
+    for img in aligned[1:]:
+        img_mean = img.reshape(-1, 3).mean(axis=0).astype(np.float32)
+        # Избегаем деления на ноль и экстремальных коррекций (клэмп 0.85–1.15)
+        gain = np.clip(ref_mean / np.maximum(img_mean, 1.0), 0.85, 1.15)
+        corrected = np.clip(img.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+        result.append(corrected)
+
+    return result
+
+
 def compute_valid_area(shape: tuple, transforms: list) -> tuple:
     """Find the intersection rectangle of all aligned frames using masks."""
     h, w = shape[:2]
@@ -366,6 +388,12 @@ def process_stack(job: Job) -> str:
     # 2. Align
     aligned, transforms = align_images(images, job)
     del images  # оригиналы больше не нужны — освобождаем
+    gc.collect()
+
+    # 2b. Match exposure — убираем видимые швы между кадрами в гладких зонах
+    job.status_text = "Выравнивание экспозиции..."
+    job.progress = 38
+    aligned = match_exposure(aligned)
     gc.collect()
 
     # 3. Focus measure + topology
