@@ -375,32 +375,73 @@ def process_stack(job: Job) -> str:
     topology = np.zeros((h, w), dtype=np.int32)
     result = np.zeros_like(aligned[0])
 
+    # Храним топ-3 кандидата на каждый пиксель для блендинга в боке-зонах
+    n_frames = len(aligned)
+    top_sharpness = np.full((h, w, 3), -np.inf, dtype=np.float32)
+    top_indices   = np.zeros((h, w, 3), dtype=np.int32)
+
     for i, img in enumerate(aligned):
         job.status_text = f"Слияние: кадр {i + 1} из {len(aligned)}..."
         job.progress = 40 + int(38 * (i + 1) / len(aligned))
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
         sharpness = compute_sharpness(gray).astype(np.float32)
         del gray
-        mask = sharpness > best_sharpness
-        best_sharpness[mask] = sharpness[mask]
+
+        # Обновляем топ-3 по каждому пикселю
+        for slot in range(3):
+            better = sharpness > top_sharpness[:, :, slot]
+            top_sharpness[:, :, slot][better] = sharpness[better]
+            top_indices[:, :, slot][better] = i
+            # Сортируем слоты по убыванию (пузырёк для 3 элементов)
+            if slot > 0:
+                for a, b in [(0,1),(1,2),(0,1)]:
+                    swap = top_sharpness[:,:,a] < top_sharpness[:,:,b]
+                    top_sharpness[:,:,a][swap], top_sharpness[:,:,b][swap] = (
+                        top_sharpness[:,:,b][swap].copy(),
+                        top_sharpness[:,:,a][swap].copy()
+                    )
+                    top_indices[:,:,a][swap], top_indices[:,:,b][swap] = (
+                        top_indices[:,:,b][swap].copy(),
+                        top_indices[:,:,a][swap].copy()
+                    )
+
+        topology[sharpness > best_sharpness] = i
+        best_sharpness[sharpness > best_sharpness] = sharpness[sharpness > best_sharpness]
         del sharpness
-        topology[mask] = i
-        result[mask] = img[mask]
-        del mask
         gc.collect()
 
-    del best_sharpness  # карта резкости больше не нужна
+    del best_sharpness
     gc.collect()
 
     # 4. Denoise topology
     job.status_text = "Сглаживание маски..."
     job.progress = 82
     topology = denoise_topology(topology)
-    for i, img in enumerate(aligned):
-        m = topology == i
-        result[m] = img[m]
-        del m
 
+    # Порог резкости: ниже него — блендим топ-3, выше — берём лучший кадр
+    sharpness_threshold = np.percentile(top_sharpness[:, :, 0], 15)
+
+    for i, img in enumerate(aligned):
+        mask_best = (topology == i) & (top_sharpness[:, :, 0] >= sharpness_threshold)
+        result[mask_best] = img[mask_best]
+        del mask_best
+
+    # В боке-зонах (низкая резкость) — среднее топ-3 кандидатов
+    blend_mask = top_sharpness[:, :, 0] < sharpness_threshold
+    if blend_mask.any():
+        blend = np.zeros((h, w, 3), dtype=np.float32)
+        for slot in range(3):
+            for i, img in enumerate(aligned):
+                m = blend_mask & (top_indices[:, :, slot] == i)
+                if m.any():
+                    blend[m] += img[m].astype(np.float32)
+        blend /= 3.0
+        result[blend_mask] = blend[blend_mask].astype(np.uint8)
+        del blend
+
+    del blend_mask
+    del top_sharpness
+    del top_indices
     del topology
     del aligned
     gc.collect()
@@ -420,7 +461,10 @@ def process_stack(job: Job) -> str:
         cv2.imwrite(result_path, result)
     else:
         result_path = str(RESULT_DIR / f"{job.job_id}.jpg")
-        cv2.imwrite(result_path, result, [cv2.IMWRITE_JPEG_QUALITY, 98])
+        cv2.imwrite(result_path, result, [
+            cv2.IMWRITE_JPEG_QUALITY, 98,
+            cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,
+        ])
 
     del result
     gc.collect()
