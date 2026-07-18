@@ -29,7 +29,7 @@ RESULT_DIR.mkdir(exist_ok=True)
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 MAX_FILES = 30
-MAX_FILE_SIZE_MB = 15
+MAX_FILE_SIZE_MB = 40  # промежуточные файлы теперь PNG (без потерь), весят больше JPEG
 MAX_LONG_SIDE = 2048
 RESULT_TTL_SECONDS = 15 * 60  # 15 minutes
 RATE_LIMIT_REQUESTS = 5
@@ -171,7 +171,7 @@ async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str
             raise HTTPException(400, f'Файл "{file.filename}" должен быть JPEG или PNG.')
         content = await file.read()
         if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
-            raise HTTPException(400, f'Файл "{file.filename}" превышает {MAX_FILE_SIZE_MB} МБ.')
+            raise HTTPException(400, f'Подготовленный файл "{file.filename}" превышает {MAX_FILE_SIZE_MB} МБ после ресайза. Попробуйте уменьшить количество кадров.')
         path = str(job_dir / f"{i:03d}.jpg")
         with open(path, "wb") as f:
             f.write(content)
