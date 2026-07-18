@@ -59,6 +59,10 @@
             <span>?</span> Инструкция
           </button>
           <div class="slap-controls">
+            <select class="fmt-select" id="method-select" title="Метод слияния">
+              <option value="sharp">Обычный (быстрее)</option>
+              <option value="wavelet">Вейвлет (без артефактов наложения)</option>
+            </select>
             <select class="fmt-select" id="fmt-select" onchange="onFormatChange()">
               <option value="jpeg">JPEG 98% (~2–4 МБ)</option>
               <option value="png">PNG без потерь (~10–20 МБ)</option>
