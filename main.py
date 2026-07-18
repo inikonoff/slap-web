@@ -373,6 +373,32 @@ def denoise_topology(topology: np.ndarray) -> np.ndarray:
     return result
 
 
+def denoise_index_map(idx_map: np.ndarray, n_frames: int) -> np.ndarray:
+    """
+    Убирает одиночные "выбросы" в карте выбора кадра-донора (та же логика,
+    что denoise_topology, но переиспользуемая отдельно для вейвлет-коэффициентов
+    любого размера — субполосы на разных уровнях имеют разную форму).
+
+    Если все 4 соседа точки не согласны с ней (выбрали другой кадр) — точка
+    считается "звоном" и заменяется медианой соседей.
+    """
+    if idx_map.shape[0] < 3 or idx_map.shape[1] < 3:
+        return idx_map  # слишком маленькая субполоса (глубокие уровни) — не трогаем
+
+    result = idx_map.copy()
+    c = idx_map[1:-1, 1:-1]
+    neighbours = np.stack([
+        idx_map[1:-1, :-2],
+        idx_map[1:-1, 2:],
+        idx_map[:-2, 1:-1],
+        idx_map[2:, 1:-1],
+    ])
+    all_differ = np.all(neighbours != c, axis=0)
+    median_n = np.median(neighbours, axis=0).astype(idx_map.dtype)
+    result[1:-1, 1:-1] = np.where(all_differ, median_n, c)
+    return result
+
+
 def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
     """
     Слияние в вейвлет-области (аналог Method C / focus-stack task_wavelet+task_merge).
@@ -414,13 +440,15 @@ def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
         merged.append(cA_stack.mean(axis=0))
         del cA_stack
 
-        # Детализация на каждом уровне — максимум по энергии между кадрами
+        # Детализация на каждом уровне — максимум по энергии между кадрами,
+        # с устранением одиночных "звонов" в карте выбора кадра-донора
         n_levels = len(coeffs_list[0])
         for lvl in range(1, n_levels):
             subbands = []
             for sub_idx in range(3):  # cH, cV, cD
                 stack = np.stack([coeffs_list[i][lvl][sub_idx] for i in range(n)])
                 best = np.argmax(np.abs(stack), axis=0)
+                best = denoise_index_map(best, n)
                 chosen = np.take_along_axis(stack, best[np.newaxis, ...], axis=0)[0]
                 subbands.append(chosen)
                 del stack, best, chosen
