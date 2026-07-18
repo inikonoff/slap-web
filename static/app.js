@@ -322,14 +322,30 @@ function onNotifyToggle() {
 
 function notifyDone() {
   if (!notifyEnabled || Notification.permission !== 'granted') return;
-  const n = new Notification('SLAP!', {
+
+  const options = {
     body: 'Готово — забирай свой стек 💥',
     icon: '/icon-192.png',
-  });
-  n.onclick = () => {
-    window.focus();
-    n.close();
   };
+
+  // На Android/Chrome при активном Service Worker прямой вызов
+  // new Notification() запрещён и выбрасывает исключение — нужно
+  // использовать ServiceWorkerRegistration.showNotification()
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.ready
+      .then(reg => reg.showNotification('SLAP!', options))
+      .catch(err => console.warn('Notification error:', err));
+  } else {
+    try {
+      const n = new Notification('SLAP!', options);
+      n.onclick = () => {
+        window.focus();
+        n.close();
+      };
+    } catch (err) {
+      console.warn('Notification error:', err);
+    }
+  }
 }
 
 // ── Result ────────────────────────────────────────────────────────────────────
@@ -338,7 +354,8 @@ function showResult(url) {
   resultImg.src        = url;
   btnDownload.href     = url;
   btnDownload.download = `slap_${Date.now()}.jpg`;
-  notifyDone();
+  // Уведомление не должно блокировать показ результата ни при каких условиях
+  try { notifyDone(); } catch (err) { console.warn('Notification error:', err); }
   showState('result');
 }
 
