@@ -251,16 +251,72 @@ def compute_sharpness(gray: np.ndarray, blur_radius: int = 21) -> np.ndarray:
     return magnitude
 
 
+def orb_affine_estimate(ref_gray: np.ndarray, gray: np.ndarray, min_matches: int = 12):
+    """
+    Пытается найти аффинное преобразование через особые точки (ORB + RANSAC).
+    Устойчив к большим сдвигам/поворотам между кадрами (в отличие от ECC,
+    которому нужен разумный начальный сдвиг для сходимости).
+
+    Возвращает (warp, inlier_count) или (None, matches_count) при неудаче.
+    """
+    orb = cv2.ORB_create(nfeatures=3000)
+    kp1, des1 = orb.detectAndCompute(ref_gray, None)
+    kp2, des2 = orb.detectAndCompute(gray, None)
+
+    if des1 is None or des2 is None or len(kp1) < min_matches or len(kp2) < min_matches:
+        return None, 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    raw_matches = bf.knnMatch(des1, des2, k=2)
+
+    # Ratio test Лоу — оставляем только уверенные совпадения
+    good = []
+    for pair in raw_matches:
+        if len(pair) == 2:
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+
+    if len(good) < min_matches:
+        return None, len(good)
+
+    ref_pts = np.float32([kp1[m.queryIdx].pt for m in good])
+    img_pts = np.float32([kp2[m.trainIdx].pt for m in good])
+
+    # ref_pts -> img_pts: та же конвенция, что и ECC ниже (для WARP_INVERSE_MAP)
+    warp, inlier_mask = cv2.estimateAffine2D(ref_pts, img_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+
+    if warp is None:
+        return None, len(good)
+
+    inlier_count = int(inlier_mask.sum()) if inlier_mask is not None else 0
+    if inlier_count < min_matches:
+        return None, inlier_count
+
+    return warp.astype(np.float32), inlier_count
+
+
 def align_images(images: list, job: Job) -> tuple:
-    """Align all images to the first frame using ECC (affine)."""
+    """
+    Выравнивает все кадры относительно первого. Для каждого кадра автоматически
+    выбирается метод:
+    1. ORB (особые точки) — пробуется первым, устойчив к большим сдвигам/поворотам
+       (типично для съёмки с рук).
+    2. ECC — запасной вариант, если ORB не нашёл достаточно надёжных совпадений
+       (гладкие кадры без выраженной текстуры).
+
+    Если оба метода не смогли выровнять кадр — обработка останавливается
+    с понятной ошибкой (кадр не выбрасывается молча, чтобы не портить результат).
+    """
     reference = images[0]
     h, w = reference.shape[:2]
-    ref_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    ref_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
+    ref_gray_f32 = ref_gray.astype(np.float32)
 
-    # Coarse alignment at reduced resolution
+    # Уменьшенная версия для ECC (для скорости)
     scale = min(1.0, 1536 / max(h, w))
-    ref_small = cv2.resize(ref_gray, None, fx=scale, fy=scale)
-    del ref_gray  # освобождаем — больше не нужна
+    ref_small = cv2.resize(ref_gray_f32, None, fx=scale, fy=scale) if scale < 1.0 else ref_gray_f32
+    del ref_gray_f32
 
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-4)
     aligned = [reference]
@@ -270,18 +326,42 @@ def align_images(images: list, job: Job) -> tuple:
         job.status_text = f"Выравнивание кадра {i} из {len(images) - 1}..."
         job.progress = 5 + int(30 * i / (len(images) - 1))
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        gray_small = cv2.resize(gray, None, fx=scale, fy=scale)
-        del gray  # освобождаем сразу после resize
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        warp = None
+        method_used = None
 
-        warp = np.eye(2, 3, dtype=np.float32)
-        try:
-            _, warp = cv2.findTransformECC(ref_small, gray_small, warp, cv2.MOTION_AFFINE, criteria)
-            warp[0, 2] /= scale
-            warp[1, 2] /= scale
-        except cv2.error:
-            logger.warning(f"ECC failed for frame {i}, using identity")
-        del gray_small
+        # 1. Пробуем ORB — устойчив к большим сдвигам/поворотам
+        orb_warp, inliers = orb_affine_estimate(ref_gray, gray)
+        if orb_warp is not None:
+            warp = orb_warp
+            method_used = "ORB"
+
+        # 2. Fallback на ECC — точнее на гладких кадрах без выраженных особых точек
+        if warp is None:
+            gray_f32 = gray.astype(np.float32)
+            gray_small = cv2.resize(gray_f32, None, fx=scale, fy=scale) if scale < 1.0 else gray_f32
+            del gray_f32
+
+            warp_ecc = np.eye(2, 3, dtype=np.float32)
+            try:
+                cc, warp_ecc = cv2.findTransformECC(ref_small, gray_small, warp_ecc, cv2.MOTION_AFFINE, criteria)
+                if cc >= 0.5:  # низкий коэффициент корреляции — ECC не сошёлся к разумному результату
+                    warp_ecc[0, 2] /= scale
+                    warp_ecc[1, 2] /= scale
+                    warp = warp_ecc
+                    method_used = "ECC"
+            except cv2.error:
+                pass
+            del gray_small
+
+        if warp is None:
+            raise ValueError(
+                f"Не удалось совместить кадр {i + 1} с остальными — сдвиг между кадрами слишком велик "
+                f"(ни ORB, ни ECC не справились). Попробуйте серию, снятую со штатива или с опорой, "
+                f"без изменения композиции между кадрами."
+            )
+
+        job.status_text = f"Выравнивание кадра {i} из {len(images) - 1} ({method_used})..."
 
         warped = cv2.warpAffine(
             img, warp, (w, h),
@@ -291,26 +371,32 @@ def align_images(images: list, job: Job) -> tuple:
         )
         aligned.append(warped)
         transforms.append(warp)
+        del gray
         gc.collect()
 
     del ref_small
     return aligned, transforms
 
 
-def match_exposure(aligned: list) -> list:
+def match_exposure(aligned: list, valid_area: tuple) -> list:
     """
     Выравнивает яркость/цвет каждого кадра относительно первого (референсного).
     Убирает видимые "швы" между донорскими зонами разных кадров в гладких
     областях (боке), где микроразличия экспозиции иначе становятся заметны.
+
+    Средняя яркость считается только по пересекающейся (valid) области —
+    если считать по всему кадру, чёрные каёмки после warpAffine на сильно
+    сдвинутых кадрах искажают оценку и портят коррекцию.
     """
+    x1, y1, x2, y2 = valid_area
     reference = aligned[0]
-    # Средняя яркость по каждому каналу референса (используем всё изображение —
-    # после ECC-выравнивания края почти совпадают, крайние случаи погоды не делают)
-    ref_mean = reference.reshape(-1, 3).mean(axis=0).astype(np.float32)
+    ref_region = reference[y1:y2, x1:x2]
+    ref_mean = ref_region.reshape(-1, 3).mean(axis=0).astype(np.float32)
 
     result = [reference]
     for img in aligned[1:]:
-        img_mean = img.reshape(-1, 3).mean(axis=0).astype(np.float32)
+        img_region = img[y1:y2, x1:x2]
+        img_mean = img_region.reshape(-1, 3).mean(axis=0).astype(np.float32)
         # Избегаем деления на ноль и экстремальных коррекций (клэмп 0.85–1.15)
         gain = np.clip(ref_mean / np.maximum(img_mean, 1.0), 0.85, 1.15)
         corrected = np.clip(img.astype(np.float32) * gain, 0, 255).astype(np.uint8)
@@ -390,7 +476,7 @@ def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
     """
     n = len(aligned)
     h, w = aligned[0].shape[:2]
-    wavelet = "db4"
+    wavelet = "sym8"  # симлеты — меньше фазовых искажений на краях, чем у Добеши (db4)
     level = 4
     mode = "periodization"  # даёт предсказуемый размер коэффициентов для реконструкции
 
@@ -428,13 +514,23 @@ def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
             for sub_idx in range(3):  # cH, cV, cD
                 stack = np.stack([coeffs_list[i][lvl][sub_idx] for i in range(n)])
                 magnitude = np.abs(stack)
-                weights = magnitude ** power
-                weights_sum = weights.sum(axis=0, keepdims=True)
+                raw_weights = magnitude ** power
+
+                # Пространственное сглаживание весов по каждому кадру — гасит
+                # одиночные всплески/звон на очень контрастных тонких структурах
+                # (аналог denoise_subbands из focus-stack, адаптированный под
+                # непрерывное взвешивание вместо дискретного выбора)
+                smoothed = np.empty_like(raw_weights)
+                for f in range(n):
+                    smoothed[f] = cv2.GaussianBlur(raw_weights[f], (0, 0), sigmaX=0.8)
+                del raw_weights
+
+                weights_sum = smoothed.sum(axis=0, keepdims=True)
                 weights_sum = np.maximum(weights_sum, 1e-8)  # защита от деления на 0
-                weights /= weights_sum
+                weights = smoothed / weights_sum
                 chosen = (stack * weights).sum(axis=0)
                 subbands.append(chosen)
-                del stack, magnitude, weights, weights_sum, chosen
+                del stack, magnitude, smoothed, weights, weights_sum, chosen
             merged.append(tuple(subbands))
             gc.collect()
 
@@ -578,10 +674,13 @@ def process_stack(job: Job) -> str:
     del images  # оригиналы больше не нужны — освобождаем
     gc.collect()
 
+    # 2a. Valid area — считаем один раз, переиспользуем в match_exposure и финальном кропе
+    valid_area = compute_valid_area(aligned[0].shape, transforms)
+
     # 2b. Match exposure — убираем видимые швы между кадрами в гладких зонах
     job.status_text = "Выравнивание экспозиции..."
     job.progress = 38
-    aligned = match_exposure(aligned)
+    aligned = match_exposure(aligned, valid_area)
     gc.collect()
 
     # 3. Merge — выбор метода
@@ -608,7 +707,7 @@ def process_stack(job: Job) -> str:
     # 5. Crop valid area
     job.status_text = "Обрезка краёв..."
     job.progress = 90
-    x1, y1, x2, y2 = compute_valid_area(result.shape, transforms)
+    x1, y1, x2, y2 = valid_area
     result = result[y1:y2, x1:x2].copy()  # .copy() освобождает ссылку на большой массив
     gc.collect()
 
