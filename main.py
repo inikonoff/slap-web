@@ -576,3 +576,68 @@ def process_stack(job: Job) -> str:
     # 2. Align
     aligned, transforms = align_images(images, job)
     del images  # оригиналы больше не нужны — освобождаем
+    gc.collect()
+
+    # 2b. Match exposure — убираем видимые швы между кадрами в гладких зонах
+    job.status_text = "Выравнивание экспозиции..."
+    job.progress = 38
+    aligned = match_exposure(aligned)
+    gc.collect()
+
+    # 3. Merge — выбор метода
+    h, w = aligned[0].shape[:2]
+
+    if job.method == "wavelet":
+        # Вейвлет-слияние — корректно обрабатывает наложения/полупрозрачность
+        result = wavelet_merge(aligned, job)
+        del aligned
+        gc.collect()
+    elif job.method == "hybrid":
+        # Гибрид: sharp там, где явный победитель; wavelet — где наложение
+        result = hybrid_merge(aligned, job)
+        del aligned
+        gc.collect()
+    else:
+        # Классический метод: выбор самого резкого пикселя (Tenengrad)
+        job.status_text = "Слияние (sharp)..."
+        job.progress = 60
+        result = sharp_merge(aligned)
+        del aligned
+        gc.collect()
+
+    # 5. Crop valid area
+    job.status_text = "Обрезка краёв..."
+    job.progress = 90
+    x1, y1, x2, y2 = compute_valid_area(result.shape, transforms)
+    result = result[y1:y2, x1:x2].copy()  # .copy() освобождает ссылку на большой массив
+    gc.collect()
+
+    # 6. Save
+    job.status_text = "Сохранение результата..."
+    job.progress = 96
+    if job.fmt == "png":
+        result_path = str(RESULT_DIR / f"{job.job_id}.png")
+        cv2.imwrite(result_path, result)
+    else:
+        result_path = str(RESULT_DIR / f"{job.job_id}.jpg")
+        cv2.imwrite(result_path, result, [
+            cv2.IMWRITE_JPEG_QUALITY, 98,
+            cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,
+        ])
+
+    del result
+    gc.collect()
+    return result_path
+
+
+# ─── Health check (keep-alive for Render free tier) ──────────────────────────
+
+@app.get("/health")
+@app.head("/health")
+@app.get("/ping")
+async def health():
+    return {"status": "ok", "service": "slap-web", "jobs": len(jobs)}
+
+
+# ─── Static files (must be last) ─────────────────────────────────────────────
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
