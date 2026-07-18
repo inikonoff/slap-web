@@ -200,13 +200,15 @@ async function startStack() {
 
   setProgress(32, 'Загрузка на сервер...');
   const formData = new FormData();
-  const fmt = document.getElementById('fmt-select').value;  // 'jpeg' | 'png'
+  const fmt = document.getElementById('fmt-select').value;        // 'jpeg' | 'png'
+  const method = document.getElementById('method-select').value;  // 'sharp' | 'wavelet'
   // Отправляем как PNG — без потерь, сервер примет любой формат
   blobs.forEach((blob, i) => {
     const name = selectedFiles[i].name.replace(/\.jpe?g$/i, '.png');
     formData.append('files', blob, name);
   });
   formData.append('fmt', fmt);
+  formData.append('method', method);
 
   let jobId;
   try {
