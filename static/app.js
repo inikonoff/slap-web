@@ -13,6 +13,7 @@ function getMaxSide(count) {
 
 let selectedFiles = [];
 let pollInterval  = null;
+let notifyEnabled = false;
 
 // ── Elements ──────────────────────────────────────────────────────────────────
 
@@ -188,6 +189,7 @@ async function startStack() {
   if (selectedFiles.length < 2) return;
 
   showState('processing');
+  renderNotifyPrompt();
   setProgress(0, 'Подготовка изображений...');
 
   let blobs;
@@ -266,12 +268,77 @@ function setProgress(pct, text) {
   statusText.textContent  = text;
 }
 
+// ── Notifications ─────────────────────────────────────────────────────────────
+
+const NOTIFY_PREF_KEY = 'slap_notify_pref';
+
+function renderNotifyPrompt() {
+  const container = document.getElementById('notify-prompt');
+  const storedPref = localStorage.getItem(NOTIFY_PREF_KEY) === 'true';
+  const supported  = 'Notification' in window;
+
+  if (supported && storedPref && Notification.permission === 'granted') {
+    // Уже включено раньше — просто напоминаем, без повторного вопроса
+    notifyEnabled = true;
+    container.innerHTML = '<span class="notify-status">🔔 Уведомим, когда будет готово</span>';
+    return;
+  }
+
+  if (!supported || Notification.permission === 'denied') {
+    // Уведомления недоступны — не показываем предложение вообще
+    notifyEnabled = false;
+    container.innerHTML = '';
+    return;
+  }
+
+  // Спрашиваем один раз за сессию (пока пользователь не включит и не запомнится выбор)
+  notifyEnabled = false;
+  container.innerHTML =
+    '<label class="notify-checkbox-label">' +
+    '<input type="checkbox" id="notify-checkbox" onchange="onNotifyToggle()" />' +
+    '<span>🔔 Уведомить, когда будет готово?</span>' +
+    '</label>';
+}
+
+function onNotifyToggle() {
+  const checkbox = document.getElementById('notify-checkbox');
+  if (!checkbox || !checkbox.checked) {
+    notifyEnabled = false;
+    return;
+  }
+  Notification.requestPermission().then(permission => {
+    notifyEnabled = permission === 'granted';
+    if (notifyEnabled) {
+      localStorage.setItem(NOTIFY_PREF_KEY, 'true');
+      renderNotifyPrompt(); // переключаем на статичный индикатор
+    } else {
+      checkbox.checked = false;
+      if (permission === 'denied') {
+        alert('Уведомления заблокированы в настройках браузера.');
+      }
+    }
+  });
+}
+
+function notifyDone() {
+  if (!notifyEnabled || Notification.permission !== 'granted') return;
+  const n = new Notification('SLAP!', {
+    body: 'Готово — забирай свой стек 💥',
+    icon: '/icon-192.png',
+  });
+  n.onclick = () => {
+    window.focus();
+    n.close();
+  };
+}
+
 // ── Result ────────────────────────────────────────────────────────────────────
 
 function showResult(url) {
   resultImg.src        = url;
   btnDownload.href     = url;
   btnDownload.download = `slap_${Date.now()}.jpg`;
+  notifyDone();
   showState('result');
 }
 

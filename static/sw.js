@@ -1,4 +1,4 @@
-const CACHE = 'slap-v8';
+const CACHE = 'slap-v10';
 const ASSETS = ['/', '/style.css', '/app.js', '/icon-192.png', '/icon-512.png'];
 
 // Установка — кэшируем статику

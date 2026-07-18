@@ -273,6 +273,30 @@ main {
   font-size: 0.9rem;
   color: var(--muted);
 }
+.notify-prompt {
+  margin-top: 16px;
+  font-size: 0.8rem;
+  min-height: 20px;
+}
+.notify-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.notify-checkbox-label input[type="checkbox"] {
+  cursor: pointer;
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+.notify-checkbox-label:hover { color: var(--text); }
+.notify-status {
+  color: var(--muted);
+  opacity: 0.85;
+}
 
 /* ── Result state ── */
 .result-wrap { padding: 20px; }
