@@ -6,6 +6,7 @@ import uuid
 import time
 import gc
 import logging
+import pywt
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -44,14 +45,15 @@ rate_limit_store: dict = {}
 
 
 class Job:
-    def __init__(self, job_id: str, file_paths: list, fmt: str = "jpeg"):
+    def __init__(self, job_id: str, file_paths: list, fmt: str = "jpeg", method: str = "sharp"):
         self.job_id = job_id
         self.file_paths = file_paths
         self.state = "queued"          # queued | processing | done | error
         self.progress = 0              # 0–100
         self.status_text = "В очереди..."
         self.queue_position = 0
-        self.fmt = fmt  # "jpeg" | "png"
+        self.fmt = fmt        # "jpeg" | "png"
+        self.method = method  # "sharp" | "wavelet"
         self.result_path: Optional[str] = None
         self.error: Optional[str] = None
         self.created_at = time.time()
@@ -152,7 +154,7 @@ def check_rate_limit(ip: str) -> bool:
 # ─── API endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/api/upload")
-async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str = Form("jpeg")):
+async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str = Form("jpeg"), method: str = Form("sharp")):
     ip = request.client.host
     if not check_rate_limit(ip):
         raise HTTPException(429, "Слишком много запросов. Попробуйте через час.")
@@ -178,7 +180,8 @@ async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str
         file_paths.append(path)
 
     fmt = fmt if fmt in ("jpeg", "png") else "jpeg"
-    job = Job(job_id, file_paths, fmt)
+    method = method if method in ("sharp", "wavelet") else "sharp"
+    job = Job(job_id, file_paths, fmt, method)
     queued_count = sum(1 for j in jobs.values() if j.state == "queued")
     job.queue_position = queued_count
     if queued_count > 0:
@@ -370,6 +373,72 @@ def denoise_topology(topology: np.ndarray) -> np.ndarray:
     return result
 
 
+def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
+    """
+    Слияние в вейвлет-области (аналог Method C / focus-stack task_wavelet+task_merge).
+
+    Для каждого канала (B, G, R):
+    - многоуровневое вейвлет-разложение каждого кадра
+    - коэффициенты детализации (края/текстуры) — выбираем по максимальной
+      энергии между кадрами на каждом уровне и субполосе (аналог focus-stack)
+    - коэффициенты аппроксимации (грубые/гладкие зоны — боке) — усредняем
+      между кадрами, что естественно убирает "швы" от разной экспозиции
+
+    Это корректно обрабатывает полупрозрачные наложения (крылья, блики на
+    хитине), где простой "выбор одного пикселя" даёт видимые артефакты.
+    """
+    n = len(aligned)
+    h, w = aligned[0].shape[:2]
+    wavelet = "db4"
+    level = 4
+    mode = "periodization"  # даёт предсказуемый размер коэффициентов для реконструкции
+
+    result = np.zeros((h, w, 3), dtype=np.float32)
+
+    for c in range(3):
+        job.status_text = f"Вейвлет-слияние: канал {c + 1} из 3..."
+        job.progress = 45 + int(35 * c / 3)
+
+        # Разложение каждого кадра по текущему каналу
+        coeffs_list = []
+        for img in aligned:
+            channel = img[:, :, c].astype(np.float32)
+            coeffs_list.append(pywt.wavedec2(channel, wavelet, level=level, mode=mode))
+        del channel
+        gc.collect()
+
+        merged = []
+
+        # Аппроксимация (самый грубый уровень) — усредняем между кадрами
+        cA_stack = np.stack([coeffs_list[i][0] for i in range(n)])
+        merged.append(cA_stack.mean(axis=0))
+        del cA_stack
+
+        # Детализация на каждом уровне — максимум по энергии между кадрами
+        n_levels = len(coeffs_list[0])
+        for lvl in range(1, n_levels):
+            subbands = []
+            for sub_idx in range(3):  # cH, cV, cD
+                stack = np.stack([coeffs_list[i][lvl][sub_idx] for i in range(n)])
+                best = np.argmax(np.abs(stack), axis=0)
+                chosen = np.take_along_axis(stack, best[np.newaxis, ...], axis=0)[0]
+                subbands.append(chosen)
+                del stack, best, chosen
+            merged.append(tuple(subbands))
+            gc.collect()
+
+        del coeffs_list
+        gc.collect()
+
+        channel_result = pywt.waverec2(merged, wavelet, mode=mode)
+        # periodization иногда даёт размер чуть больше исходного — обрезаем
+        result[:, :, c] = channel_result[:h, :w]
+        del merged, channel_result
+        gc.collect()
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def process_stack(job: Job) -> str:
     """Full stacking pipeline: load → resize → align → focusmeasure → merge → crop → save."""
 
@@ -396,42 +465,49 @@ def process_stack(job: Job) -> str:
     aligned = match_exposure(aligned)
     gc.collect()
 
-    # 3. Focus measure + topology
-    # best_sharpness храним как float32 вместо float64 — вдвое меньше памяти
+    # 3. Merge — выбор метода
     h, w = aligned[0].shape[:2]
-    best_sharpness = np.full((h, w), -np.inf, dtype=np.float32)
-    topology = np.zeros((h, w), dtype=np.int32)
-    result = np.zeros_like(aligned[0])
 
-    for i, img in enumerate(aligned):
-        job.status_text = f"Слияние: кадр {i + 1} из {len(aligned)}..."
-        job.progress = 40 + int(38 * (i + 1) / len(aligned))
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        sharpness = compute_sharpness(gray).astype(np.float32)
-        del gray
-        mask = sharpness > best_sharpness
-        best_sharpness[mask] = sharpness[mask]
-        del sharpness
-        topology[mask] = i
-        result[mask] = img[mask]
-        del mask
+    if job.method == "wavelet":
+        # Вейвлет-слияние — корректно обрабатывает наложения/полупрозрачность
+        result = wavelet_merge(aligned, job)
+        del aligned
+        gc.collect()
+    else:
+        # Классический метод: выбор самого резкого пикселя (Tenengrad)
+        best_sharpness = np.full((h, w), -np.inf, dtype=np.float32)
+        topology = np.zeros((h, w), dtype=np.int32)
+        result = np.zeros_like(aligned[0])
+
+        for i, img in enumerate(aligned):
+            job.status_text = f"Слияние: кадр {i + 1} из {len(aligned)}..."
+            job.progress = 40 + int(38 * (i + 1) / len(aligned))
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            sharpness = compute_sharpness(gray).astype(np.float32)
+            del gray
+            mask = sharpness > best_sharpness
+            best_sharpness[mask] = sharpness[mask]
+            del sharpness
+            topology[mask] = i
+            result[mask] = img[mask]
+            del mask
+            gc.collect()
+
+        del best_sharpness
         gc.collect()
 
-    del best_sharpness
-    gc.collect()
+        # 4. Denoise topology
+        job.status_text = "Сглаживание маски..."
+        job.progress = 82
+        topology = denoise_topology(topology)
+        for i, img in enumerate(aligned):
+            m = topology == i
+            result[m] = img[m]
+            del m
 
-    # 4. Denoise topology
-    job.status_text = "Сглаживание маски..."
-    job.progress = 82
-    topology = denoise_topology(topology)
-    for i, img in enumerate(aligned):
-        m = topology == i
-        result[m] = img[m]
-        del m
-
-    del topology
-    del aligned
-    gc.collect()
+        del topology
+        del aligned
+        gc.collect()
 
     # 5. Crop valid area
     job.status_text = "Обрезка краёв..."
