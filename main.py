@@ -180,7 +180,7 @@ async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str
         file_paths.append(path)
 
     fmt = fmt if fmt in ("jpeg", "png") else "jpeg"
-    method = method if method in ("sharp", "wavelet") else "sharp"
+    method = method if method in ("sharp", "wavelet", "hybrid") else "sharp"
     job = Job(job_id, file_paths, fmt, method)
     queued_count = sum(1 for j in jobs.values() if j.state == "queued")
     job.queue_position = queued_count
@@ -373,31 +373,6 @@ def denoise_topology(topology: np.ndarray) -> np.ndarray:
     return result
 
 
-def denoise_index_map(idx_map: np.ndarray, n_frames: int) -> np.ndarray:
-    """
-    Убирает одиночные "выбросы" в карте выбора кадра-донора (та же логика,
-    что denoise_topology, но переиспользуемая отдельно для вейвлет-коэффициентов
-    любого размера — субполосы на разных уровнях имеют разную форму).
-
-    Если все 4 соседа точки не согласны с ней (выбрали другой кадр) — точка
-    считается "звоном" и заменяется медианой соседей.
-    """
-    if idx_map.shape[0] < 3 or idx_map.shape[1] < 3:
-        return idx_map  # слишком маленькая субполоса (глубокие уровни) — не трогаем
-
-    result = idx_map.copy()
-    c = idx_map[1:-1, 1:-1]
-    neighbours = np.stack([
-        idx_map[1:-1, :-2],
-        idx_map[1:-1, 2:],
-        idx_map[:-2, 1:-1],
-        idx_map[2:, 1:-1],
-    ])
-    all_differ = np.all(neighbours != c, axis=0)
-    median_n = np.median(neighbours, axis=0).astype(idx_map.dtype)
-    result[1:-1, 1:-1] = np.where(all_differ, median_n, c)
-    return result
-
 
 def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
     """
@@ -440,18 +415,26 @@ def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
         merged.append(cA_stack.mean(axis=0))
         del cA_stack
 
-        # Детализация на каждом уровне — максимум по энергии между кадрами,
-        # с устранением одиночных "звонов" в карте выбора кадра-донора
+        # Детализация на каждом уровне — плавное взвешенное смешивание вместо
+        # жёсткого выбора "победителя". Резкое переключение между кадрами
+        # само по себе создаёт звон (ringing) в частотной области — вес по
+        # степени магнитуды даёт доминирующему кадру почти весь вклад, но
+        # без разрывного скачка на границе, что и убирает рябь.
         n_levels = len(coeffs_list[0])
+        power = 4.0  # чем выше — тем ближе к жёсткому выбору (но без разрыва)
+
         for lvl in range(1, n_levels):
             subbands = []
             for sub_idx in range(3):  # cH, cV, cD
                 stack = np.stack([coeffs_list[i][lvl][sub_idx] for i in range(n)])
-                best = np.argmax(np.abs(stack), axis=0)
-                best = denoise_index_map(best, n)
-                chosen = np.take_along_axis(stack, best[np.newaxis, ...], axis=0)[0]
+                magnitude = np.abs(stack)
+                weights = magnitude ** power
+                weights_sum = weights.sum(axis=0, keepdims=True)
+                weights_sum = np.maximum(weights_sum, 1e-8)  # защита от деления на 0
+                weights /= weights_sum
+                chosen = (stack * weights).sum(axis=0)
                 subbands.append(chosen)
-                del stack, best, chosen
+                del stack, magnitude, weights, weights_sum, chosen
             merged.append(tuple(subbands))
             gc.collect()
 
@@ -465,6 +448,114 @@ def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
         gc.collect()
 
     return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def sharp_merge(aligned: list) -> np.ndarray:
+    """
+    Классический метод: выбор пикселя с максимальной резкостью (Tenengrad),
+    с денойзом topology-карты. Вынесено в отдельную функцию для переиспользования
+    в process_stack и в hybrid_merge.
+    """
+    h, w = aligned[0].shape[:2]
+    best_sharpness = np.full((h, w), -np.inf, dtype=np.float32)
+    topology = np.zeros((h, w), dtype=np.int32)
+    result = np.zeros_like(aligned[0])
+
+    for i, img in enumerate(aligned):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        sharpness = compute_sharpness(gray).astype(np.float32)
+        del gray
+        mask = sharpness > best_sharpness
+        best_sharpness[mask] = sharpness[mask]
+        del sharpness
+        topology[mask] = i
+        result[mask] = img[mask]
+        del mask
+        gc.collect()
+
+    del best_sharpness
+    gc.collect()
+
+    topology = denoise_topology(topology)
+    for i, img in enumerate(aligned):
+        m = topology == i
+        result[m] = img[m]
+        del m
+
+    del topology
+    gc.collect()
+    return result
+
+
+def compute_confidence_map(aligned: list) -> np.ndarray:
+    """
+    Карта уверенности "победителя" по резкости для каждого пикселя: нормализованная
+    разница между лучшим и вторым по резкости кандидатом среди всех кадров.
+
+    Большая разница (~1.0) — явный победитель, типичная резкая деталь без наложений.
+    Малая разница (~0.0) — кандидаты близки, признак наложения/неоднозначности
+    (полупрозрачные структуры), где вейвлет-слияние работает корректнее.
+    """
+    sharpness_stack = []
+    for img in aligned:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        sharpness_stack.append(compute_sharpness(gray))
+        del gray
+
+    stack = np.stack(sharpness_stack, axis=0)
+    del sharpness_stack
+    gc.collect()
+
+    # np.sort по оси кадров даёт стабильный порядок без риска ошибок
+    # индексации (в отличие от предыдущей ручной сортировки "пузырьком")
+    sorted_desc = np.sort(stack, axis=0)[::-1]
+    del stack
+    best = sorted_desc[0]
+    second = sorted_desc[1] if sorted_desc.shape[0] > 1 else sorted_desc[0]
+    del sorted_desc
+    gc.collect()
+
+    eps = 1e-6
+    confidence = (best - second) / (best + second + eps)
+    confidence = np.clip(confidence, 0.0, 1.0).astype(np.float32)
+
+    # Сглаживаем границы, чтобы переход между sharp/wavelet вкладом был плавным
+    confidence = cv2.GaussianBlur(confidence, (0, 0), sigmaX=15)
+    return confidence
+
+
+def hybrid_merge(aligned: list, job: Job) -> np.ndarray:
+    """
+    Смешивает sharp и wavelet методы по карте уверенности:
+    - высокая уверенность (явный победитель по резкости) → берём sharp-результат
+    - низкая уверенность (наложение/неоднозначность) → берём wavelet-результат
+    Граница между вкладами сглаживается, без резких швов.
+    """
+    job.status_text = "Гибрид: базовое слияние (sharp)..."
+    job.progress = 40
+    sharp_result = sharp_merge(aligned)
+    gc.collect()
+
+    job.status_text = "Гибрид: вейвлет-слияние..."
+    job.progress = 55
+    wavelet_result = wavelet_merge(aligned, job)
+    gc.collect()
+
+    job.status_text = "Гибрид: карта уверенности..."
+    job.progress = 88
+    confidence = compute_confidence_map(aligned)
+
+    job.status_text = "Гибрид: смешивание..."
+    job.progress = 92
+    confidence_3ch = confidence[:, :, np.newaxis]
+    blended = (
+        confidence_3ch * sharp_result.astype(np.float32)
+        + (1.0 - confidence_3ch) * wavelet_result.astype(np.float32)
+    )
+    del sharp_result, wavelet_result, confidence, confidence_3ch
+    gc.collect()
+
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def process_stack(job: Job) -> str:
@@ -485,91 +576,3 @@ def process_stack(job: Job) -> str:
     # 2. Align
     aligned, transforms = align_images(images, job)
     del images  # оригиналы больше не нужны — освобождаем
-    gc.collect()
-
-    # 2b. Match exposure — убираем видимые швы между кадрами в гладких зонах
-    job.status_text = "Выравнивание экспозиции..."
-    job.progress = 38
-    aligned = match_exposure(aligned)
-    gc.collect()
-
-    # 3. Merge — выбор метода
-    h, w = aligned[0].shape[:2]
-
-    if job.method == "wavelet":
-        # Вейвлет-слияние — корректно обрабатывает наложения/полупрозрачность
-        result = wavelet_merge(aligned, job)
-        del aligned
-        gc.collect()
-    else:
-        # Классический метод: выбор самого резкого пикселя (Tenengrad)
-        best_sharpness = np.full((h, w), -np.inf, dtype=np.float32)
-        topology = np.zeros((h, w), dtype=np.int32)
-        result = np.zeros_like(aligned[0])
-
-        for i, img in enumerate(aligned):
-            job.status_text = f"Слияние: кадр {i + 1} из {len(aligned)}..."
-            job.progress = 40 + int(38 * (i + 1) / len(aligned))
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            sharpness = compute_sharpness(gray).astype(np.float32)
-            del gray
-            mask = sharpness > best_sharpness
-            best_sharpness[mask] = sharpness[mask]
-            del sharpness
-            topology[mask] = i
-            result[mask] = img[mask]
-            del mask
-            gc.collect()
-
-        del best_sharpness
-        gc.collect()
-
-        # 4. Denoise topology
-        job.status_text = "Сглаживание маски..."
-        job.progress = 82
-        topology = denoise_topology(topology)
-        for i, img in enumerate(aligned):
-            m = topology == i
-            result[m] = img[m]
-            del m
-
-        del topology
-        del aligned
-        gc.collect()
-
-    # 5. Crop valid area
-    job.status_text = "Обрезка краёв..."
-    job.progress = 90
-    x1, y1, x2, y2 = compute_valid_area(result.shape, transforms)
-    result = result[y1:y2, x1:x2].copy()  # .copy() освобождает ссылку на большой массив
-    gc.collect()
-
-    # 6. Save
-    job.status_text = "Сохранение результата..."
-    job.progress = 96
-    if job.fmt == "png":
-        result_path = str(RESULT_DIR / f"{job.job_id}.png")
-        cv2.imwrite(result_path, result)
-    else:
-        result_path = str(RESULT_DIR / f"{job.job_id}.jpg")
-        cv2.imwrite(result_path, result, [
-            cv2.IMWRITE_JPEG_QUALITY, 98,
-            cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,
-        ])
-
-    del result
-    gc.collect()
-    return result_path
-
-
-# ─── Health check (keep-alive for Render free tier) ──────────────────────────
-
-@app.get("/health")
-@app.head("/health")
-@app.get("/ping")
-async def health():
-    return {"status": "ok", "service": "slap-web", "jobs": len(jobs)}
-
-
-# ─── Static files (must be last) ─────────────────────────────────────────────
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
