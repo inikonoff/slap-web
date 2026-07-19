@@ -54,15 +54,16 @@ rate_limit_store: dict = {}
 
 
 class Job:
-    def __init__(self, job_id: str, file_paths: list, fmt: str = "jpeg", method: str = "sharp"):
+    def __init__(self, job_id: str, file_paths: list, fmt: str = "jpeg", method: str = "sharp", fix_motion: bool = False):
         self.job_id = job_id
         self.file_paths = file_paths
         self.state = "queued"          # queued | processing | done | error
         self.progress = 0              # 0–100
         self.status_text = "В очереди..."
         self.queue_position = 0
-        self.fmt = fmt        # "jpeg" | "png"
-        self.method = method  # "sharp" | "wavelet"
+        self.fmt = fmt              # "jpeg" | "png"
+        self.method = method        # "sharp" | "wavelet" | "hybrid"
+        self.fix_motion = fix_motion  # устранять "призраки" от движения объекта
         self.result_path: Optional[str] = None
         self.error: Optional[str] = None
         self.created_at = time.time()
@@ -163,7 +164,7 @@ def check_rate_limit(ip: str) -> bool:
 # ─── API endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/api/upload")
-async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str = Form("jpeg"), method: str = Form("sharp")):
+async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str = Form("jpeg"), method: str = Form("sharp"), fix_motion: bool = Form(False)):
     ip = request.client.host
     if not check_rate_limit(ip):
         raise HTTPException(429, "Слишком много запросов. Попробуйте через час.")
@@ -190,7 +191,7 @@ async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str
 
     fmt = fmt if fmt in ("jpeg", "png") else "jpeg"
     method = method if method in ("sharp", "wavelet", "hybrid") else "sharp"
-    job = Job(job_id, file_paths, fmt, method)
+    job = Job(job_id, file_paths, fmt, method, fix_motion)
     queued_count = sum(1 for j in jobs.values() if j.state == "queued")
     job.queue_position = queued_count
     if queued_count > 0:
@@ -410,6 +411,82 @@ def match_exposure(aligned: list, valid_area: tuple) -> list:
         result.append(corrected)
 
     return result
+
+
+def detect_motion_mask(aligned: list, low_sigma: float = 8.0, threshold_factor: float = 2.5) -> np.ndarray:
+    """
+    Находит зоны, где кадры расходятся по НИЗКОЧАСТОТНОМУ содержимому даже
+    после глобального выравнивания — признак реального локального движения
+    объекта (шевельнулась лапка/усик у живого насекомого), а не просто разной
+    резкости/фокуса (которая влияет в основном на высокие частоты и является
+    нормой для focus stacking).
+
+    Возвращает бинарную маску (uint8, 0/255) проблемных зон.
+    """
+    low_freq_stack = []
+    for img in aligned:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        low = cv2.GaussianBlur(gray, (0, 0), sigmaX=low_sigma)
+        low_freq_stack.append(low)
+        del gray
+
+    stack = np.stack(low_freq_stack)
+    del low_freq_stack
+    variance_map = stack.var(axis=0)
+    del stack
+    gc.collect()
+
+    threshold = variance_map.mean() + threshold_factor * variance_map.std()
+    mask = (variance_map > threshold).astype(np.uint8) * 255
+    del variance_map
+
+    # Убираем мелкий шум маски (одиночные пиксели) и заполняем небольшие дыры
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+
+    return mask
+
+
+def fix_motion_ghosting(result: np.ndarray, aligned: list, mask: np.ndarray) -> np.ndarray:
+    """
+    В зонах, отмеченных detect_motion_mask, заменяет смешанный результат на
+    ОДИН цельный кадр (тот, что резче всего именно в этой зоне) — убирает
+    "призрак"/раздвоение от локального движения объекта между кадрами.
+    Края перехода смягчаются (feather), чтобы не было жёсткого шва.
+    """
+    n_labels, labels = cv2.connectedComponents(mask)
+    if n_labels <= 1:
+        return result  # проблемных зон не найдено
+
+    sharpness_maps = []
+    for img in aligned:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        sharpness_maps.append(compute_sharpness(gray))
+        del gray
+    gc.collect()
+
+    result_fixed = result.astype(np.float32)
+
+    for label in range(1, n_labels):
+        component_mask = (labels == label)
+        if component_mask.sum() < 20:
+            continue  # игнорируем совсем мелкие шумовые пятна
+
+        # Кадр с максимальной суммарной резкостью именно в этой зоне
+        scores = [sm[component_mask].sum() for sm in sharpness_maps]
+        best_idx = int(np.argmax(scores))
+
+        # Мягкие края перехода — растушёвка бинарной маски компонента
+        soft = component_mask.astype(np.float32)
+        soft = cv2.GaussianBlur(soft, (0, 0), sigmaX=2.0)
+        alpha = soft[:, :, np.newaxis]
+
+        result_fixed = alpha * aligned[best_idx].astype(np.float32) + (1 - alpha) * result_fixed
+        del component_mask, soft, alpha
+
+    del sharpness_maps
+    gc.collect()
+    return np.clip(result_fixed, 0, 255).astype(np.uint8)
 
 
 def compute_valid_area(shape: tuple, transforms: list) -> tuple:
@@ -696,20 +773,26 @@ def process_stack(job: Job) -> str:
     if job.method == "wavelet":
         # Вейвлет-слияние — корректно обрабатывает наложения/полупрозрачность
         result = wavelet_merge(aligned, job)
-        del aligned
-        gc.collect()
     elif job.method == "hybrid":
         # Гибрид: sharp там, где явный победитель; wavelet — где наложение
         result = hybrid_merge(aligned, job)
-        del aligned
-        gc.collect()
     else:
         # Классический метод: выбор самого резкого пикселя (Tenengrad)
         job.status_text = "Слияние (sharp)..."
         job.progress = 60
         result = sharp_merge(aligned)
-        del aligned
+
+    # 4b. Устранение "призраков" от локального движения объекта (опционально)
+    if job.fix_motion:
+        job.status_text = "Устранение смаза от движения..."
+        job.progress = 85
+        motion_mask = detect_motion_mask(aligned)
+        result = fix_motion_ghosting(result, aligned, motion_mask)
+        del motion_mask
         gc.collect()
+
+    del aligned
+    gc.collect()
 
     # 5. Crop valid area
     job.status_text = "Обрезка краёв..."
@@ -728,6 +811,8 @@ def process_stack(job: Job) -> str:
     del result_rgb
 
     method_label = METHOD_LABELS.get(job.method, job.method)
+    if job.fix_motion:
+        method_label += " + motion fix"
     exif = pil_img.getexif()
     exif[0x010E] = f"Stacked with SLAP - method: {method_label} - stacklikea.pro"  # ImageDescription
     exif[0x0131] = "SLAP - Stack Like A Pro"  # Software
