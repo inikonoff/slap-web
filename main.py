@@ -7,6 +7,7 @@ import time
 import gc
 import logging
 import pywt
+from PIL import Image
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,14 @@ MAX_LONG_SIDE = 2048
 RESULT_TTL_SECONDS = 15 * 60  # 15 minutes
 RATE_LIMIT_REQUESTS = 5
 RATE_LIMIT_WINDOW = 3600  # per hour
+
+# Названия методов для EXIF-метаданных результата (ASCII — для совместимости
+# со всеми просмотрщиками; полные однословные имена — Snap/Weave/Prism)
+METHOD_LABELS = {
+    "sharp": "Snap (Pixel Select)",
+    "wavelet": "Weave (Wavelet Fusion)",
+    "hybrid": "Prism (Hybrid Blend)",
+}
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -709,19 +718,28 @@ def process_stack(job: Job) -> str:
     result = result[y1:y2, x1:x2].copy()  # .copy() освобождает ссылку на большой массив
     gc.collect()
 
-    # 6. Save
+    # 6. Save (через Pillow — умеет писать EXIF-метаданные и для JPEG, и для PNG)
     job.status_text = "Сохранение результата..."
     job.progress = 96
+
+    # OpenCV хранит цвет как BGR, Pillow ожидает RGB
+    result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(result_rgb)
+    del result_rgb
+
+    method_label = METHOD_LABELS.get(job.method, job.method)
+    exif = pil_img.getexif()
+    exif[0x010E] = f"Stacked with SLAP - method: {method_label} - stacklikea.pro"  # ImageDescription
+    exif[0x0131] = "SLAP - Stack Like A Pro"  # Software
+
     if job.fmt == "png":
         result_path = str(RESULT_DIR / f"{job.job_id}.png")
-        cv2.imwrite(result_path, result)
+        pil_img.save(result_path, exif=exif)
     else:
         result_path = str(RESULT_DIR / f"{job.job_id}.jpg")
-        cv2.imwrite(result_path, result, [
-            cv2.IMWRITE_JPEG_QUALITY, 98,
-            cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,
-        ])
+        pil_img.save(result_path, quality=98, subsampling=0, exif=exif)  # subsampling=0 — это 4:4:4
 
+    del pil_img
     del result
     gc.collect()
     return result_path
