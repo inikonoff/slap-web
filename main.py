@@ -220,12 +220,10 @@ async def get_result(job_id: str):
         raise HTTPException(404, "Результат не найден.")
     if not os.path.exists(job.result_path):
         raise HTTPException(404, "Файл результата уже удалён.")
-    ext = "png" if job.fmt == "png" else "jpg"
     mime = "image/png" if job.fmt == "png" else "image/jpeg"
     return FileResponse(
         job.result_path,
         media_type=mime,
-        filename=f"slap_{job_id[:8]}.{ext}",
     )
 
 
