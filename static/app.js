@@ -274,43 +274,46 @@ const NOTIFY_PREF_KEY = 'slap_notify_pref';
 
 function renderNotifyPrompt() {
   const container = document.getElementById('notify-prompt');
-  const storedPref = localStorage.getItem(NOTIFY_PREF_KEY) === 'true';
-  const supported  = 'Notification' in window;
-
-  if (supported && storedPref && Notification.permission === 'granted') {
-    // Уже включено раньше — просто напоминаем, без повторного вопроса
-    notifyEnabled = true;
-    container.innerHTML = '<span class="notify-status">🔔 Уведомим, когда будет готово</span>';
-    return;
-  }
+  const supported = 'Notification' in window;
 
   if (!supported || Notification.permission === 'denied') {
-    // Уведомления недоступны — не показываем предложение вообще
+    // Уведомления недоступны на уровне браузера — не показываем предложение
     notifyEnabled = false;
     container.innerHTML = '';
     return;
   }
 
-  // Спрашиваем один раз за сессию (пока пользователь не включит и не запомнится выбор)
-  notifyEnabled = false;
+  const storedPref = localStorage.getItem(NOTIFY_PREF_KEY) === 'true';
+  notifyEnabled = storedPref && Notification.permission === 'granted';
+
   container.innerHTML =
     '<label class="notify-checkbox-label">' +
-    '<input type="checkbox" id="notify-checkbox" onchange="onNotifyToggle()" />' +
+    `<input type="checkbox" id="notify-checkbox" ${notifyEnabled ? 'checked' : ''} onchange="onNotifyToggle()" />` +
     '<span>🔔 Уведомить, когда будет готово?</span>' +
     '</label>';
 }
 
 function onNotifyToggle() {
   const checkbox = document.getElementById('notify-checkbox');
-  if (!checkbox || !checkbox.checked) {
+  if (!checkbox) return;
+
+  if (!checkbox.checked) {
+    // Пользователь снял галочку — просто выключаем, разрешение браузера не трогаем
     notifyEnabled = false;
+    localStorage.setItem(NOTIFY_PREF_KEY, 'false');
     return;
   }
+
+  if (Notification.permission === 'granted') {
+    notifyEnabled = true;
+    localStorage.setItem(NOTIFY_PREF_KEY, 'true');
+    return;
+  }
+
   Notification.requestPermission().then(permission => {
     notifyEnabled = permission === 'granted';
     if (notifyEnabled) {
       localStorage.setItem(NOTIFY_PREF_KEY, 'true');
-      renderNotifyPrompt(); // переключаем на статичный индикатор
     } else {
       checkbox.checked = false;
       if (permission === 'denied') {
@@ -350,10 +353,24 @@ function notifyDone() {
 
 // ── Result ────────────────────────────────────────────────────────────────────
 
+const METHOD_WORDS = { sharp: 'snap', wavelet: 'weave', hybrid: 'prism' };
+
+function formatTimestamp(date) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(date.getDate())}${pad(date.getMonth() + 1)}${pad(date.getHours())}${pad(date.getMinutes())}`;
+}
+
 function showResult(url) {
-  resultImg.src        = url;
-  btnDownload.href     = url;
-  btnDownload.download = `slap_${Date.now()}.jpg`;
+  resultImg.src    = url;
+  btnDownload.href = url;
+
+  const method     = document.getElementById('method-select').value;
+  const fmt        = document.getElementById('fmt-select').value;
+  const methodWord = METHOD_WORDS[method] || method;
+  const ext        = fmt === 'png' ? 'png' : 'jpg';
+  const timestamp  = formatTimestamp(new Date());
+  btnDownload.download = `slap_${timestamp}_${methodWord}.${ext}`;
+
   // Уведомление не должно блокировать показ результата ни при каких условиях
   try { notifyDone(); } catch (err) { console.warn('Notification error:', err); }
   showState('result');
