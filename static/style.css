@@ -298,6 +298,24 @@ main {
   opacity: 0.85;
 }
 
+.motion-fix-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 20px 14px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.motion-fix-label input[type="checkbox"] {
+  cursor: pointer;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+.motion-fix-label:hover { color: var(--text); }
+
 /* ── Result state ── */
 .result-wrap { padding: 20px; }
 .result-img {

@@ -202,8 +202,9 @@ async function startStack() {
 
   setProgress(32, 'Загрузка на сервер...');
   const formData = new FormData();
-  const fmt = document.getElementById('fmt-select').value;        // 'jpeg' | 'png'
-  const method = document.getElementById('method-select').value;  // 'sharp' | 'wavelet'
+  const fmt        = document.getElementById('fmt-select').value;          // 'jpeg' | 'png'
+  const method     = document.getElementById('method-select').value;       // 'sharp' | 'wavelet' | 'hybrid'
+  const fixMotion  = document.getElementById('fix-motion-checkbox').checked;
   // Отправляем как PNG — без потерь, сервер примет любой формат
   blobs.forEach((blob, i) => {
     const name = selectedFiles[i].name.replace(/\.jpe?g$/i, '.png');
@@ -211,6 +212,7 @@ async function startStack() {
   });
   formData.append('fmt', fmt);
   formData.append('method', method);
+  formData.append('fix_motion', fixMotion ? 'true' : 'false');
 
   let jobId;
   try {
