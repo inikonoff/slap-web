@@ -205,6 +205,7 @@ async function startStack() {
   const fmt        = document.getElementById('fmt-select').value;          // 'jpeg' | 'png'
   const method     = document.getElementById('method-select').value;       // 'sharp' | 'wavelet' | 'hybrid'
   const fixMotion  = document.getElementById('fix-motion-checkbox').checked;
+  const skipAlign  = document.getElementById('skip-align-checkbox').checked;
   // Отправляем как PNG — без потерь, сервер примет любой формат
   blobs.forEach((blob, i) => {
     const name = selectedFiles[i].name.replace(/\.jpe?g$/i, '.png');
@@ -213,6 +214,7 @@ async function startStack() {
   formData.append('fmt', fmt);
   formData.append('method', method);
   formData.append('fix_motion', fixMotion ? 'true' : 'false');
+  formData.append('skip_align', skipAlign ? 'true' : 'false');
 
   let jobId;
   try {
