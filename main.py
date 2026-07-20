@@ -54,7 +54,7 @@ rate_limit_store: dict = {}
 
 
 class Job:
-    def __init__(self, job_id: str, file_paths: list, fmt: str = "jpeg", method: str = "sharp", fix_motion: bool = False):
+    def __init__(self, job_id: str, file_paths: list, fmt: str = "jpeg", method: str = "sharp", fix_motion: bool = False, skip_align: bool = False):
         self.job_id = job_id
         self.file_paths = file_paths
         self.state = "queued"          # queued | processing | done | error
@@ -64,6 +64,7 @@ class Job:
         self.fmt = fmt              # "jpeg" | "png"
         self.method = method        # "sharp" | "wavelet" | "hybrid"
         self.fix_motion = fix_motion  # устранять "призраки" от движения объекта
+        self.skip_align = skip_align  # кадры уже выровнены (штатив/рельса) — пропустить ORB/ECC/warpAffine
         self.result_path: Optional[str] = None
         self.error: Optional[str] = None
         self.created_at = time.time()
@@ -164,7 +165,7 @@ def check_rate_limit(ip: str) -> bool:
 # ─── API endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/api/upload")
-async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str = Form("jpeg"), method: str = Form("sharp"), fix_motion: bool = Form(False)):
+async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str = Form("jpeg"), method: str = Form("sharp"), fix_motion: bool = Form(False), skip_align: bool = Form(False)):
     ip = request.client.host
     if not check_rate_limit(ip):
         raise HTTPException(429, "Слишком много запросов. Попробуйте через час.")
@@ -191,7 +192,7 @@ async def upload(request: Request, files: list[UploadFile] = File(...), fmt: str
 
     fmt = fmt if fmt in ("jpeg", "png") else "jpeg"
     method = method if method in ("sharp", "wavelet", "hybrid") else "sharp"
-    job = Job(job_id, file_paths, fmt, method, fix_motion)
+    job = Job(job_id, file_paths, fmt, method, fix_motion, skip_align)
     queued_count = sum(1 for j in jobs.values() if j.state == "queued")
     job.queue_position = queued_count
     if queued_count > 0:
@@ -315,7 +316,22 @@ def align_images(images: list, job: Job) -> tuple:
 
     Если оба метода не смогли выровнять кадр — обработка останавливается
     с понятной ошибкой (кадр не выбрасывается молча, чтобы не портить результат).
+
+    Если job.skip_align — считаем, что кадры уже точно совмещены (штатив/рельса
+    с ручной фокусировкой) и НЕ трогаем пиксели вообще: ни ORB, ни ECC, ни
+    warpAffine не вызываются. Это не просто экономия времени — warpAffine
+    делает билинейную интерполяцию даже при почти единичной матрице (реальный
+    ORB/ECC на статичных кадрах почти никогда не даёт ИДЕАЛЬНОГО тождества,
+    а даёт крохотный сабпиксельный сдвиг из-за шума детекции), и это заметно
+    на самых мелких деталях (волоски, края усиков).
     """
+    if job.skip_align:
+        job.status_text = "Кадры уже выровнены — пропускаем ORB/ECC..."
+        job.progress = 30
+        h, w = images[0].shape[:2]
+        identity = [np.eye(2, 3, dtype=np.float32) for _ in images]
+        return list(images), identity
+
     reference = images[0]
     h, w = reference.shape[:2]
     ref_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
@@ -413,7 +429,7 @@ def match_exposure(aligned: list, valid_area: tuple) -> list:
     return result
 
 
-def detect_motion_mask(aligned: list, low_sigma: float = 8.0, threshold_factor: float = 2.5) -> np.ndarray:
+def detect_motion_mask(aligned: list, valid_area: tuple = None, low_sigma: float = 8.0, threshold_factor: float = 2.5) -> np.ndarray:
     """
     Находит зоны, где кадры расходятся по НИЗКОЧАСТОТНОМУ содержимому даже
     после глобального выравнивания — признак реального локального движения
@@ -443,6 +459,21 @@ def detect_motion_mask(aligned: list, low_sigma: float = 8.0, threshold_factor: 
     # Убираем мелкий шум маски (одиночные пиксели) и заполняем небольшие дыры
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+
+    # Полоса у краёв valid_area — это почти всегда остаточная нестыковка
+    # выравнивания/параллакс заднего плана между кадрами (а не движение
+    # объекта на переднем плане). Без этого исключения маска ложно
+    # захватывает широкие зоны у краёв кадра, и fix_motion_ghosting потом
+    # рисует по ним резкий шов. Съедаем внутрь valid_area на 8% меньшей
+    # стороны кадра.
+    if valid_area is not None:
+        x1, y1, x2, y2 = valid_area
+        h, w = mask.shape[:2]
+        margin = int(0.08 * min(x2 - x1, y2 - y1))
+        interior = np.zeros_like(mask)
+        interior[y1 + margin:y2 - margin, x1 + margin:x2 - margin] = 255
+        mask = cv2.bitwise_and(mask, interior)
+        del interior
 
     return mask
 
@@ -476,9 +507,13 @@ def fix_motion_ghosting(result: np.ndarray, aligned: list, mask: np.ndarray) -> 
         scores = [sm[component_mask].sum() for sm in sharpness_maps]
         best_idx = int(np.argmax(scores))
 
-        # Мягкие края перехода — растушёвка бинарной маски компонента
+        # Мягкие края перехода — растушёвка бинарной маски компонента.
+        # sigma поднята с 2.0 до 15.0 (тот же порядок, что и в
+        # confidence-карте hybrid): на крупных зонах узкая растушёвка
+        # оставляла заметный резкий контур именно на плавных градиентах
+        # (кожа, боке), где глаз особенно чувствителен к шву.
         soft = component_mask.astype(np.float32)
-        soft = cv2.GaussianBlur(soft, (0, 0), sigmaX=2.0)
+        soft = cv2.GaussianBlur(soft, (0, 0), sigmaX=15.0)
         alpha = soft[:, :, np.newaxis]
 
         result_fixed = alpha * aligned[best_idx].astype(np.float32) + (1 - alpha) * result_fixed
@@ -591,7 +626,13 @@ def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
         # степени магнитуды даёт доминирующему кадру почти весь вклад, но
         # без разрывного скачка на границе, что и убирает рябь.
         n_levels = len(coeffs_list[0])
-        power = 4.0  # чем выше — тем ближе к жёсткому выбору (но без разрыва)
+        # power ниже (было 4.0) — меньше похоже на жёсткий выбор победителя,
+        # больше похоже на честное взвешенное смешивание. Резкий выбор на
+        # каждом уровне декомпозиции по отдельности — и есть источник
+        # Gibbs-звона на высококонтрастных тонких структурах (усики на фоне
+        # расфокуса): на разных уровнях "победитель" немного расходится,
+        # и после waverec2 это складывается в кольца вокруг края.
+        power = 2.5
 
         for lvl in range(1, n_levels):
             subbands = []
@@ -603,10 +644,13 @@ def wavelet_merge(aligned: list, job: Job) -> np.ndarray:
                 # Пространственное сглаживание весов по каждому кадру — гасит
                 # одиночные всплески/звон на очень контрастных тонких структурах
                 # (аналог denoise_subbands из focus-stack, адаптированный под
-                # непрерывное взвешивание вместо дискретного выбора)
+                # непрерывное взвешивание вместо дискретного выбора).
+                # sigmaX увеличен с 0.8 до 2.0 — старое значение сглаживало
+                # веса недостаточно, чтобы погасить звон на тонких контрастных
+                # линиях (усики) через несколько уровней декомпозиции разом.
                 smoothed = np.empty_like(raw_weights)
                 for f in range(n):
-                    smoothed[f] = cv2.GaussianBlur(raw_weights[f], (0, 0), sigmaX=0.8)
+                    smoothed[f] = cv2.GaussianBlur(raw_weights[f], (0, 0), sigmaX=2.0)
                 del raw_weights
 
                 weights_sum = smoothed.sum(axis=0, keepdims=True)
@@ -786,7 +830,7 @@ def process_stack(job: Job) -> str:
     if job.fix_motion:
         job.status_text = "Устранение смаза от движения..."
         job.progress = 85
-        motion_mask = detect_motion_mask(aligned)
+        motion_mask = detect_motion_mask(aligned, valid_area)
         result = fix_motion_ghosting(result, aligned, motion_mask)
         del motion_mask
         gc.collect()
@@ -813,6 +857,8 @@ def process_stack(job: Job) -> str:
     method_label = METHOD_LABELS.get(job.method, job.method)
     if job.fix_motion:
         method_label += " + motion fix"
+    if job.skip_align:
+        method_label += " + no-align"
     exif = pil_img.getexif()
     exif[0x010E] = f"Stacked with SLAP - method: {method_label} - stacklikea.pro"  # ImageDescription
     exif[0x0131] = "SLAP - Stack Like A Pro"  # Software
